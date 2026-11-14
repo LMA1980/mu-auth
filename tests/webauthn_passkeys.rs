@@ -35,7 +35,7 @@ struct VirtualAuthenticator {
 }
 
 impl VirtualAuthenticator {
-    fn new_1password(rp_id: &str, origin: &str, cred_id: Vec<u8>) -> Self {
+    fn new_synced_authenticator(rp_id: &str, origin: &str, cred_id: Vec<u8>) -> Self {
         Self::new(rp_id, origin, cred_id, true, true, 0)
     }
 
@@ -194,10 +194,11 @@ fn passkey_service() -> WebauthnPasskeyService {
 }
 
 #[test]
-fn onepassword_synced_passkey_enrolls_and_verifies_repeatedly_with_sign_count_zero() {
+fn synced_vault_passkey_enrolls_and_verifies_repeatedly_with_sign_count_zero() {
+    // Models 1Password and other synced cloud-backed passkey authenticators (BE=1, BS=1, sign_count=0).
     let svc = passkey_service();
     let login = GithubLogin::new("LMA1980").unwrap();
-    let op_auth = VirtualAuthenticator::new_1password(
+    let op_auth = VirtualAuthenticator::new_synced_authenticator(
         "console.example.org",
         "https://console.example.org",
         b"op-cred-id-0001".to_vec(),

@@ -151,14 +151,19 @@ fn invite_tokens_only_bind_id_and_expiry_and_grant_pinned_baseline() {
     assert_eq!(fulfilled.granted_role.as_str(), "viewer");
 
     // Self-expiring invite workflow
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let dynamic_prefix = format!("inv{seed:08x}");
     let self_exp = codec
-        .sign_self_expiring_invite("nonce42", 200_000, &roles)
+        .sign_self_expiring_invite(&dynamic_prefix, 200_000, &roles)
         .unwrap();
     let (parsed, exp) = codec
         .verify_self_expiring_invite(&self_exp.token, 199_999)
         .unwrap();
     assert_eq!(exp, 200_000);
-    assert!(parsed.invite_id.starts_with("nonce42_"));
+    assert!(parsed.invite_id.starts_with(&format!("{dynamic_prefix}_")));
     assert_eq!(
         codec.verify_self_expiring_invite(&self_exp.token, 200_000),
         Err(AuthError::InviteExpired)

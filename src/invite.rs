@@ -152,29 +152,29 @@ impl InviteCodec {
         })
     }
 
-    /// Signs a self-contained invite encoding expiry inside `invite_id` as `<nonce>_<expires_ms_hex>`.
+    /// Signs a self-contained invite encoding expiry inside `invite_id` as `<id_prefix>_<expires_ms_hex>`.
     pub fn sign_self_expiring_invite(
         &self,
-        nonce: &str,
+        id_prefix: &str,
         expires_at_ms: u64,
         role_catalog: &RoleCatalog,
     ) -> Result<SignedInvite, AuthError> {
-        validate_invite_id(nonce)?;
-        let invite_id = format!("{nonce}_{expires_at_ms:x}");
+        validate_invite_id(id_prefix)?;
+        let invite_id = format!("{id_prefix}_{expires_at_ms:x}");
         self.sign_invite(&invite_id, expires_at_ms, role_catalog)
     }
 
-    /// Verifies a self-expiring `inv_<nonce>_<expires_ms_hex>.<hmac>` token in constant time.
+    /// Verifies a self-expiring `inv_<id_prefix>_<expires_ms_hex>.<hmac>` token in constant time.
     pub fn verify_self_expiring_invite(
         &self,
         raw_token: &str,
         now_ms: u64,
     ) -> Result<(ParsedInviteToken, u64), AuthError> {
         let parsed = parse_invite_token(raw_token)?;
-        let Some((nonce, exp_hex)) = parsed.invite_id.rsplit_once('_') else {
+        let Some((id_prefix, exp_hex)) = parsed.invite_id.rsplit_once('_') else {
             return Err(AuthError::InvalidInviteToken);
         };
-        if nonce.is_empty() {
+        if id_prefix.is_empty() {
             return Err(AuthError::InvalidInviteToken);
         }
         let expires_at_ms =
