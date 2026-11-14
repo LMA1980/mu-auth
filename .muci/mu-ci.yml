@@ -26,7 +26,10 @@ tasks:
 
   audit-task:
     tool: "cargo-audit"
-    args: []
+    # webauthn-rs-core 0.6.2 -> crypto-glue 0.2.2 locks rsa 0.10.0-rc.19 (with crypto-bigint
+    # constant-time mitigations); rsa 0.10.0 removed the `sha2` feature crypto-glue selects,
+    # and mu-auth performs no RSA private-key operations.
+    args: ["--ignore", "RUSTSEC-2023-0071"]
     timeout_seconds: 180
     sandbox_profile: "default_ci"
 
