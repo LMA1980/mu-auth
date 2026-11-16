@@ -17,6 +17,24 @@ pub const HOST_TIMED_ROLE_CEILING_SECS: u64 = 1800;
 /// Minimum allowed hard or idle TTL for `Timed` elevated roles (1 minute).
 pub const MIN_TIMED_ROLE_TTL_SECS: u64 = 60;
 
+/// Canonical identifier for the Passkey-gated, renewable all-access `super-operator` role.
+pub const SUPER_OPERATOR_ROLE_ID: &str = "super-operator";
+
+/// Initial session duration for `super-operator` in seconds (15 minutes).
+pub const SUPER_OPERATOR_HARD_TTL_SECS: u64 = 900;
+
+/// Idle inactivity timeout for `super-operator` in seconds (2 minutes).
+pub const SUPER_OPERATOR_IDLE_TTL_SECS: u64 = 120;
+
+/// Final window before hard expiry during which `super-operator` may be renewed (2 minutes).
+pub const SUPER_OPERATOR_RENEW_WINDOW_SECS: u64 = 120;
+
+/// Duration added to `super-operator` upon Passkey-confirmed renewal in seconds (15 minutes).
+pub const SUPER_OPERATOR_RENEW_EXTEND_SECS: u64 = 900;
+
+/// Maximum number of Passkey-confirmed renewals allowed per `super-operator` lease.
+pub const SUPER_OPERATOR_MAX_RENEWALS: u32 = 1;
+
 /// Reserved pseudo-role identifier used in index documentation; rejected in `RoleCatalog`.
 pub const ANONYMOUS_ROLE_ID: &str = "anonymous";
 
@@ -132,10 +150,19 @@ pub enum RoleActivation {
     Elective,
     /// Dormant at login; requires Passkey step-up and expires independently via hard + idle TTLs.
     Timed {
-        /// Non-renewable hard lease ceiling in seconds (`<= HOST_TIMED_ROLE_CEILING_SECS`).
+        /// Initial hard lease ceiling in seconds (`cumulative hard TTL <= HOST_TIMED_ROLE_CEILING_SECS`).
         hard_ttl_secs: u64,
         /// Explicit-activity idle deadline in seconds (`60 <= idle_ttl_secs <= hard_ttl_secs`).
         idle_ttl_secs: u64,
+        /// Window in seconds before hard expiry when Passkey renewal opens (`0` disables renewal).
+        #[serde(default)]
+        renew_window_secs: u64,
+        /// Extension added to the hard expiry deadline upon Passkey-confirmed renewal in seconds.
+        #[serde(default)]
+        renew_extend_secs: u64,
+        /// Maximum number of renewals permitted per session lease (`0` disables renewal).
+        #[serde(default)]
+        max_renewals: u32,
     },
 }
 
@@ -209,7 +236,7 @@ impl RoleSpec {
         )
     }
 
-    /// Constructs a short-lived `Timed` role requiring `StepUpRequirement::Passkey`.
+    /// Constructs a short-lived non-renewable `Timed` role requiring `StepUpRequirement::Passkey`.
     pub fn timed(
         id: RoleId,
         display_name: Option<&str>,
@@ -224,9 +251,55 @@ impl RoleSpec {
             RoleActivation::Timed {
                 hard_ttl_secs,
                 idle_ttl_secs,
+                renew_window_secs: 0,
+                renew_extend_secs: 0,
+                max_renewals: 0,
             },
             StepUpRequirement::Passkey,
         )
+    }
+
+    /// Constructs a renewable short-lived `Timed` role requiring `StepUpRequirement::Passkey`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn timed_renewable(
+        id: RoleId,
+        display_name: Option<&str>,
+        description: impl Into<String>,
+        hard_ttl_secs: u64,
+        idle_ttl_secs: u64,
+        renew_window_secs: u64,
+        renew_extend_secs: u64,
+        max_renewals: u32,
+    ) -> Result<Self, FolioError> {
+        Self::new(
+            id,
+            display_name,
+            description,
+            RoleActivation::Timed {
+                hard_ttl_secs,
+                idle_ttl_secs,
+                renew_window_secs,
+                renew_extend_secs,
+                max_renewals,
+            },
+            StepUpRequirement::Passkey,
+        )
+    }
+
+    /// Constructs the canonical Passkey-gated all-access `super-operator` role.
+    #[must_use]
+    pub fn super_operator() -> Self {
+        Self::timed_renewable(
+            RoleId::new(SUPER_OPERATOR_ROLE_ID).expect("canonical super-operator role id"),
+            Some("Super Operator"),
+            "All-access Passkey role (2m idle, 15m session, single +15m last-2m renewal)",
+            SUPER_OPERATOR_HARD_TTL_SECS,
+            SUPER_OPERATOR_IDLE_TTL_SECS,
+            SUPER_OPERATOR_RENEW_WINDOW_SECS,
+            SUPER_OPERATOR_RENEW_EXTEND_SECS,
+            SUPER_OPERATOR_MAX_RENEWALS,
+        )
+        .expect("canonical super-operator role bounds must be valid")
     }
 
     /// Validates all naming, reserved-ID, and TTL ceiling invariants.
@@ -240,6 +313,9 @@ impl RoleSpec {
         if let RoleActivation::Timed {
             hard_ttl_secs,
             idle_ttl_secs,
+            renew_window_secs,
+            renew_extend_secs,
+            max_renewals,
         } = self.activation
         {
             if hard_ttl_secs > HOST_TIMED_ROLE_CEILING_SECS {
@@ -263,6 +339,36 @@ impl RoleSpec {
                     hard_ttl_secs,
                     min_ttl_secs: MIN_TIMED_ROLE_TTL_SECS,
                 });
+            }
+            if max_renewals == 0 {
+                if renew_window_secs != 0 || renew_extend_secs != 0 {
+                    return Err(FolioError::InvalidTimedRenewalBounds {
+                        renew_window_secs,
+                        renew_extend_secs,
+                        max_renewals,
+                        hard_ttl_secs,
+                    });
+                }
+            } else {
+                if renew_window_secs < MIN_TIMED_ROLE_TTL_SECS
+                    || renew_window_secs > hard_ttl_secs
+                    || renew_extend_secs < MIN_TIMED_ROLE_TTL_SECS
+                {
+                    return Err(FolioError::InvalidTimedRenewalBounds {
+                        renew_window_secs,
+                        renew_extend_secs,
+                        max_renewals,
+                        hard_ttl_secs,
+                    });
+                }
+                let cumulative_hard = hard_ttl_secs
+                    .saturating_add(u64::from(max_renewals).saturating_mul(renew_extend_secs));
+                if cumulative_hard > HOST_TIMED_ROLE_CEILING_SECS {
+                    return Err(FolioError::TtlExceedsCeiling {
+                        requested_secs: cumulative_hard,
+                        ceiling_secs: HOST_TIMED_ROLE_CEILING_SECS,
+                    });
+                }
             }
             if self.step_up != StepUpRequirement::Passkey {
                 return Err(FolioError::TimedRoleRequiresPasskey(self.id.to_string()));
@@ -596,7 +702,10 @@ mod tests {
                 "timed without passkey",
                 RoleActivation::Timed {
                     hard_ttl_secs: 300,
-                    idle_ttl_secs: 120
+                    idle_ttl_secs: 120,
+                    renew_window_secs: 0,
+                    renew_extend_secs: 0,
+                    max_renewals: 0,
                 },
                 StepUpRequirement::None
             ),

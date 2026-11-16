@@ -9,6 +9,7 @@ use crate::error::FolioError;
 use crate::folio::{FolioCatalog, PolicySet};
 use crate::role::{
     RoleActivation, RoleCatalog, RoleFolioIndex, RoleId, RoleSpec, StepUpRequirement,
+    HOST_TIMED_ROLE_CEILING_SECS,
 };
 use crate::subsystem::{FolioId, SubsystemId};
 
@@ -38,7 +39,7 @@ pub struct RoleLease {
     /// Most recent explicit user activity timestamp (`epoch_ms`).
     #[serde(default)]
     pub last_activity_at_ms: u64,
-    /// Non-renewable hard expiry deadline (`epoch_ms`).
+    /// Hard expiry deadline (`epoch_ms`), extendable only within spec renewal bounds.
     pub hard_expires_at_ms: u64,
     /// Explicit-activity idle expiry deadline (`epoch_ms`), capped by `hard_expires_at_ms`.
     pub idle_expires_at_ms: u64,
@@ -46,6 +47,18 @@ pub struct RoleLease {
     pub hard_ttl_secs: u64,
     /// Configured server idle TTL in seconds.
     pub idle_ttl_secs: u64,
+    /// Window in seconds before hard expiry when Passkey renewal opens (`0` = non-renewable).
+    #[serde(default)]
+    pub renew_window_secs: u64,
+    /// Hard-deadline extension granted per approved Passkey renewal in seconds.
+    #[serde(default)]
+    pub renew_extend_secs: u64,
+    /// Maximum number of renewals permitted during one session (`0` = non-renewable).
+    #[serde(default)]
+    pub max_renewals: u32,
+    /// Count of renewals already consumed during this lease.
+    #[serde(default)]
+    pub renewals_used: u32,
 }
 
 impl RoleLease {
@@ -55,6 +68,9 @@ impl RoleLease {
         let RoleActivation::Timed {
             hard_ttl_secs,
             idle_ttl_secs,
+            renew_window_secs,
+            renew_extend_secs,
+            max_renewals,
         } = spec.activation
         else {
             return Err(FolioError::UnauthorizedActivation {
@@ -75,7 +91,27 @@ impl RoleLease {
             idle_expires_at_ms,
             hard_ttl_secs,
             idle_ttl_secs,
+            renew_window_secs,
+            renew_extend_secs,
+            max_renewals,
+            renewals_used: 0,
         })
+    }
+
+    /// Number of Passkey-confirmed renewals remaining for this lease.
+    #[must_use]
+    pub const fn renewals_remaining(&self) -> u32 {
+        self.max_renewals.saturating_sub(self.renewals_used)
+    }
+
+    /// Returns `true` when the lease is active, has renewals remaining, and is within its final `renew_window_secs`.
+    #[must_use]
+    pub fn can_renew(&self, now_ms: u64) -> bool {
+        self.is_active(now_ms)
+            && self.renewals_remaining() > 0
+            && self.renew_window_secs > 0
+            && self.renew_extend_secs > 0
+            && self.hard_remaining_secs(now_ms) <= self.renew_window_secs
     }
 
     /// Effective earliest deadline across hard and idle limits.
@@ -270,6 +306,121 @@ impl RoleLeases {
             .expect("inserted lease must be present"))
     }
 
+    /// Extends an active renewable `Timed` lease during its final `renew_window_secs`
+    /// after fresh Passkey step-up verification.
+    pub fn renew_timed(
+        &mut self,
+        role_catalog: &RoleCatalog,
+        principal: &Principal,
+        role: &RoleId,
+        now_ms: u64,
+        step_up_verified: bool,
+    ) -> Result<&RoleLease, FolioError> {
+        let Principal::Authenticated {
+            passkey_count,
+            bound_roles,
+            ..
+        } = principal
+        else {
+            return Err(FolioError::AuthorizationDenied);
+        };
+
+        if *passkey_count == 0 {
+            return Err(FolioError::PasskeyEnrollmentRequired);
+        }
+        if !bound_roles.contains(role) {
+            return Err(FolioError::UnauthorizedActivation {
+                role: role.to_string(),
+            });
+        }
+
+        let spec = role_catalog
+            .get(role)
+            .ok_or_else(|| FolioError::UnknownRole(role.to_string()))?;
+
+        let RoleActivation::Timed {
+            hard_ttl_secs,
+            idle_ttl_secs,
+            renew_window_secs,
+            renew_extend_secs,
+            max_renewals,
+        } = spec.activation
+        else {
+            return Err(FolioError::UnauthorizedActivation {
+                role: role.to_string(),
+            });
+        };
+
+        if spec.step_up == StepUpRequirement::Passkey && !step_up_verified {
+            return Err(FolioError::StepUpRequired {
+                role: role.to_string(),
+            });
+        }
+
+        let Some(existing) = self.timed_leases.get(role) else {
+            return Err(FolioError::UnauthorizedActivation {
+                role: role.to_string(),
+            });
+        };
+        if !existing.is_active(now_ms) {
+            self.timed_leases.remove(role);
+            return Err(FolioError::UnauthorizedActivation {
+                role: role.to_string(),
+            });
+        }
+        if max_renewals == 0 || renew_window_secs == 0 || renew_extend_secs == 0 {
+            return Err(FolioError::LeaseNotRenewable {
+                role: role.to_string(),
+            });
+        }
+
+        let lease = self
+            .timed_leases
+            .get_mut(role)
+            .expect("verified active lease must be present");
+        if lease.renewals_used >= max_renewals {
+            return Err(FolioError::RenewalLimitReached {
+                role: role.to_string(),
+                max_renewals,
+            });
+        }
+
+        let hard_remaining = lease.hard_remaining_secs(now_ms);
+        if hard_remaining > renew_window_secs {
+            return Err(FolioError::RenewalWindowNotReached {
+                role: role.to_string(),
+                seconds_remaining: hard_remaining,
+                renew_window_secs,
+            });
+        }
+
+        lease.renewals_used = lease.renewals_used.saturating_add(1);
+        let allowed_cumulative_secs = hard_ttl_secs
+            .saturating_add(u64::from(lease.renewals_used).saturating_mul(renew_extend_secs))
+            .min(HOST_TIMED_ROLE_CEILING_SECS);
+        let server_hard_cap = lease
+            .activated_at_ms
+            .saturating_add(allowed_cumulative_secs.saturating_mul(1000));
+        lease.hard_expires_at_ms = lease
+            .hard_expires_at_ms
+            .saturating_add(renew_extend_secs.saturating_mul(1000))
+            .min(server_hard_cap);
+        lease.last_activity_at_ms = lease.last_activity_at_ms.max(now_ms);
+        lease.idle_expires_at_ms = now_ms
+            .saturating_add(idle_ttl_secs.saturating_mul(1000))
+            .min(lease.hard_expires_at_ms);
+        lease.hard_ttl_secs = hard_ttl_secs;
+        lease.idle_ttl_secs = idle_ttl_secs;
+        lease.renew_window_secs = renew_window_secs;
+        lease.renew_extend_secs = renew_extend_secs;
+        lease.max_renewals = max_renewals;
+
+        Ok(self
+            .timed_leases
+            .get(role)
+            .expect("renewed lease must be present"))
+    }
+
     /// Explicitly toggles off an `Elective` or `Timed` role; forbids disabling `PinnedBaseline`.
     pub fn disable_role(
         &mut self,
@@ -458,6 +609,9 @@ pub fn evaluate_session_with_disabled_subsystems(
                 let RoleActivation::Timed {
                     hard_ttl_secs,
                     idle_ttl_secs,
+                    renew_window_secs,
+                    renew_extend_secs,
+                    max_renewals,
                 } = spec.activation
                 else {
                     expired_timed_roles.push(role_id.clone());
@@ -465,27 +619,35 @@ pub fn evaluate_session_with_disabled_subsystems(
                 };
 
                 // Clamp deserialized lease deadlines strictly to current server RoleSpec ceilings.
+                let clamped_renewals = lease.renewals_used.min(max_renewals);
+                let allowed_hard_secs = hard_ttl_secs
+                    .saturating_add(u64::from(clamped_renewals).saturating_mul(renew_extend_secs))
+                    .min(HOST_TIMED_ROLE_CEILING_SECS);
                 let server_hard_cap = lease
                     .activated_at_ms
-                    .saturating_add(hard_ttl_secs.saturating_mul(1000));
+                    .saturating_add(allowed_hard_secs.saturating_mul(1000));
+                let clamped_hard_expires = lease.hard_expires_at_ms.min(server_hard_cap);
                 let clamped_activity = lease
                     .last_activity_at_ms
                     .max(lease.activated_at_ms)
                     .min(now_ms);
                 let server_idle_cap = clamped_activity
                     .saturating_add(idle_ttl_secs.saturating_mul(1000))
-                    .min(server_hard_cap)
-                    .min(lease.hard_expires_at_ms)
+                    .min(clamped_hard_expires)
                     .min(lease.idle_expires_at_ms);
 
                 let clamped = RoleLease {
                     role: lease.role.clone(),
                     activated_at_ms: lease.activated_at_ms,
                     last_activity_at_ms: clamped_activity,
-                    hard_expires_at_ms: lease.hard_expires_at_ms.min(server_hard_cap),
+                    hard_expires_at_ms: clamped_hard_expires,
                     idle_expires_at_ms: server_idle_cap,
                     hard_ttl_secs,
                     idle_ttl_secs,
+                    renew_window_secs,
+                    renew_extend_secs,
+                    max_renewals,
+                    renewals_used: clamped_renewals,
                 };
 
                 if clamped.is_active(now_ms) {

@@ -79,6 +79,38 @@ pub enum FolioError {
     },
     /// `Timed` roles must require `StepUpRequirement::Passkey`.
     TimedRoleRequiresPasskey(String),
+    /// `Timed` role renewal configuration violates ceiling or ordering bounds.
+    InvalidTimedRenewalBounds {
+        /// Configured renewal eligibility window before hard expiry in seconds.
+        renew_window_secs: u64,
+        /// Configured per-renewal extension duration in seconds.
+        renew_extend_secs: u64,
+        /// Configured maximum number of renewals per lease.
+        max_renewals: u32,
+        /// Initial hard lease TTL in seconds.
+        hard_ttl_secs: u64,
+    },
+    /// `Timed` lease does not allow renewal (`max_renewals == 0`).
+    LeaseNotRenewable {
+        /// Role identifier that cannot be renewed.
+        role: String,
+    },
+    /// `Timed` lease cannot yet be renewed because remaining hard time exceeds `renew_window_secs`.
+    RenewalWindowNotReached {
+        /// Role identifier awaiting the renewal window.
+        role: String,
+        /// Whole seconds remaining until hard lease expiry.
+        seconds_remaining: u64,
+        /// Window in seconds before hard expiry when renewal opens.
+        renew_window_secs: u64,
+    },
+    /// `Timed` lease has already consumed its configured maximum renewals.
+    RenewalLimitReached {
+        /// Role identifier that exhausted its renewals.
+        role: String,
+        /// Configured maximum renewals allowed per lease.
+        max_renewals: u32,
+    },
     /// Policy prefix or subsystem assignment does not match its declaring `SubsystemSecurityManifest`.
     PolicySubsystemMismatch {
         /// Policy identifier.
@@ -167,6 +199,32 @@ impl fmt::Display for FolioError {
             ),
             Self::TimedRoleRequiresPasskey(id) => {
                 write!(f, "timed role {id} must require Passkey step-up")
+            }
+            Self::InvalidTimedRenewalBounds {
+                renew_window_secs,
+                renew_extend_secs,
+                max_renewals,
+                hard_ttl_secs,
+            } => write!(
+                f,
+                "invalid timed renewal bounds: window={renew_window_secs}s extend={renew_extend_secs}s max_renewals={max_renewals} hard_ttl={hard_ttl_secs}s"
+            ),
+            Self::LeaseNotRenewable { role } => {
+                write!(f, "timed lease for role {role} is not renewable")
+            }
+            Self::RenewalWindowNotReached {
+                role,
+                seconds_remaining,
+                renew_window_secs,
+            } => write!(
+                f,
+                "timed lease for role {role} can only be renewed in its final {renew_window_secs}s ({seconds_remaining}s remaining)"
+            ),
+            Self::RenewalLimitReached { role, max_renewals } => {
+                write!(
+                    f,
+                    "timed lease for role {role} has already used its {max_renewals} allowed renewal(s)"
+                )
             }
             Self::PolicySubsystemMismatch {
                 policy,
