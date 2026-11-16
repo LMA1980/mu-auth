@@ -1123,6 +1123,21 @@ pub fn canonical_manifests() -> [SubsystemSecurityManifest; 8] {
     ]
 }
 
+/// Returns the 8 top-level canonical subsystem folios bound to `super-operator`.
+#[must_use]
+pub fn canonical_super_operator_folios() -> [FolioId; 8] {
+    [
+        FolioId::new("folio:system:dashboard").expect("canonical folio id"),
+        FolioId::new("folio:ci:operate").expect("canonical folio id"),
+        FolioId::new("folio:cd:read").expect("canonical folio id"),
+        FolioId::new("folio:ab:operate").expect("canonical folio id"),
+        FolioId::new("folio:reg:operate").expect("canonical folio id"),
+        FolioId::new("folio:obs:ingress-admin").expect("canonical folio id"),
+        FolioId::new("folio:mr:connect").expect("canonical folio id"),
+        FolioId::new("folio:platform:admin").expect("canonical folio id"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,10 +3,12 @@
 use std::collections::BTreeSet;
 
 use mu_auth::{
-    canonical_manifests, evaluate_session, AuthAuthority, FolioCatalog, FolioError, FolioId,
-    FolioOrigin, MaintenanceOverride, PolicyFolio, PolicyId, Principal, RoleCatalog,
-    RoleFolioIndex, RoleId, RoleLeases, RoleSpec, StepUpRequirement, SubsystemId, SubsystemStatus,
-    HOST_TIMED_ROLE_CEILING_SECS,
+    canonical_manifests, canonical_super_operator_folios, evaluate_session, AuthAuthority,
+    FolioCatalog, FolioError, FolioId, FolioOrigin, MaintenanceOverride, PolicyFolio, PolicyId,
+    Principal, RoleActivation, RoleCatalog, RoleFolioIndex, RoleId, RoleLeases, RoleSpec,
+    StepUpRequirement, SubsystemId, SubsystemStatus, HOST_TIMED_ROLE_CEILING_SECS,
+    SUPER_OPERATOR_HARD_TTL_SECS, SUPER_OPERATOR_IDLE_TTL_SECS, SUPER_OPERATOR_MAX_RENEWALS,
+    SUPER_OPERATOR_RENEW_EXTEND_SECS, SUPER_OPERATOR_RENEW_WINDOW_SECS, SUPER_OPERATOR_ROLE_ID,
 };
 
 fn rid(raw: &str) -> RoleId {
@@ -388,4 +390,201 @@ fn maintenance_override_handles_all_5_states_and_autoclear() {
         MaintenanceOverride::resolve_effective(SubsystemStatus::Live, Some(&ov), 301_000),
         SubsystemStatus::Live
     );
+}
+
+#[test]
+fn super_operator_grants_all_subsystems_enforces_idle_and_allows_single_last_2m_passkey_renewal() {
+    let manifests = canonical_manifests();
+    let expected_policies: BTreeSet<PolicyId> = manifests
+        .iter()
+        .flat_map(|m| m.policies.iter().map(|p| p.id.clone()))
+        .collect();
+    assert_eq!(expected_policies.len(), 47);
+
+    let mut auth = baseline_authority();
+    let super_spec = RoleSpec::super_operator();
+    assert_eq!(super_spec.id.as_str(), SUPER_OPERATOR_ROLE_ID);
+    assert_eq!(super_spec.step_up, StepUpRequirement::Passkey);
+    assert_eq!(
+        super_spec.activation,
+        RoleActivation::Timed {
+            hard_ttl_secs: SUPER_OPERATOR_HARD_TTL_SECS,
+            idle_ttl_secs: SUPER_OPERATOR_IDLE_TTL_SECS,
+            renew_window_secs: SUPER_OPERATOR_RENEW_WINDOW_SECS,
+            renew_extend_secs: SUPER_OPERATOR_RENEW_EXTEND_SECS,
+            max_renewals: SUPER_OPERATOR_MAX_RENEWALS,
+        }
+    );
+    auth.role_catalog.upsert_role(super_spec).unwrap();
+    auth.role_folio_index
+        .set_role_folios(
+            rid(SUPER_OPERATOR_ROLE_ID),
+            BTreeSet::from(canonical_super_operator_folios()),
+            &auth.folio_catalog,
+            &auth.role_catalog,
+        )
+        .unwrap();
+
+    let non_renewable = RoleSpec::timed(rid("ci-temp"), None, "Non-renewable", 300, 120).unwrap();
+    auth.role_catalog.upsert_role(non_renewable).unwrap();
+    auth.role_folio_index
+        .set_role_folios(
+            rid("ci-temp"),
+            BTreeSet::from([fid("folio:ci:read")]),
+            &auth.folio_catalog,
+            &auth.role_catalog,
+        )
+        .unwrap();
+
+    // Validation rejects invalid renewal bounds and cumulative TTL > 1800s.
+    assert!(matches!(
+        RoleSpec::timed_renewable(rid("bad-win"), None, "too big win", 300, 120, 301, 300, 1),
+        Err(FolioError::InvalidTimedRenewalBounds { .. })
+    ));
+    assert!(matches!(
+        RoleSpec::timed_renewable(
+            rid("over-ceil"),
+            None,
+            "cumulative over 1800",
+            900,
+            120,
+            120,
+            901,
+            1
+        ),
+        Err(FolioError::TtlExceedsCeiling {
+            requested_secs: 1801,
+            ceiling_secs: 1800
+        })
+    ));
+
+    let principal = Principal::Authenticated {
+        login: "LMA1980".into(),
+        passkey_count: 1,
+        bound_roles: BTreeSet::from([rid("viewer"), rid(SUPER_OPERATOR_ROLE_ID), rid("ci-temp")]),
+    };
+
+    let mut leases = RoleLeases::for_login(&auth.role_catalog, &principal);
+    assert!(matches!(
+        leases.activate_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            0,
+            false
+        ),
+        Err(FolioError::StepUpRequired { .. })
+    ));
+
+    leases
+        .activate_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            0,
+            true,
+        )
+        .unwrap();
+    leases
+        .activate_timed(&auth.role_catalog, &principal, &rid("ci-temp"), 0, true)
+        .unwrap();
+
+    // All 47 policies across all 8 subsystems are active immediately upon activation.
+    let eval_initial = auth.evaluate_session(&principal, &leases, 1_000).unwrap();
+    let granted_initial: BTreeSet<PolicyId> = eval_initial.policies.iter().cloned().collect();
+    assert_eq!(granted_initial, expected_policies);
+
+    // Non-renewable timed lease rejects renewal while active.
+    assert!(matches!(
+        leases.renew_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid("ci-temp"),
+            50_000,
+            true
+        ),
+        Err(FolioError::LeaseNotRenewable { .. })
+    ));
+
+    // Activity keep-alive sustains the 2m idle timer up to the final 2m window, whereas no
+    // activity for 120s expires the idle timer independently.
+    for t in [
+        100_000, 200_000, 300_000, 400_000, 500_000, 600_000, 700_000, 779_000,
+    ] {
+        leases.record_activity(t);
+    }
+    let lease_before = &leases.timed_leases[&rid(SUPER_OPERATOR_ROLE_ID)];
+    assert!(!lease_before.can_renew(779_000));
+    assert!(matches!(
+        leases.renew_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            779_000,
+            true
+        ),
+        Err(FolioError::RenewalWindowNotReached {
+            seconds_remaining: 121,
+            renew_window_secs: 120,
+            ..
+        })
+    ));
+
+    // Inside final 2m (13m00s = 780_000ms), Passkey confirmation is still mandatory.
+    assert!(leases.timed_leases[&rid(SUPER_OPERATOR_ROLE_ID)].can_renew(780_000));
+    assert!(matches!(
+        leases.renew_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            780_000,
+            false
+        ),
+        Err(FolioError::StepUpRequired { .. })
+    ));
+
+    // Renewing with Passkey at 13m00s extends hard deadline to 30m (1_800_000ms) and resets idle to +2m.
+    let renewed = leases
+        .renew_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            780_000,
+            true,
+        )
+        .unwrap()
+        .clone();
+    assert_eq!(renewed.hard_expires_at_ms, 1_800_000);
+    assert_eq!(renewed.idle_expires_at_ms, 900_000);
+    assert_eq!(renewed.renewals_used, 1);
+    assert!(!renewed.can_renew(780_000));
+
+    // Second renewal fails fail-closed even within last 2m of the extended window.
+    leases.record_activity(850_000);
+    assert!(matches!(
+        leases.renew_timed(
+            &auth.role_catalog,
+            &principal,
+            &rid(SUPER_OPERATOR_ROLE_ID),
+            850_000,
+            true
+        ),
+        Err(FolioError::RenewalLimitReached {
+            max_renewals: 1,
+            ..
+        })
+    ));
+
+    // `evaluate_session` preserves the extended hard deadline past the original 15m mark.
+    leases.record_activity(950_000);
+    let eval_extended = auth.evaluate_session(&principal, &leases, 950_000).unwrap();
+    assert!(eval_extended.has_role_str(SUPER_OPERATOR_ROLE_ID));
+    let granted_extended: BTreeSet<PolicyId> = eval_extended.policies.iter().cloned().collect();
+    assert_eq!(granted_extended, expected_policies);
+
+    // Leaving the session idle for >= 2m expires super-operator cleanly.
+    let eval_idle_expired = auth
+        .evaluate_session(&principal, &leases, 1_070_000)
+        .unwrap();
+    assert!(!eval_idle_expired.has_role_str(SUPER_OPERATOR_ROLE_ID));
 }

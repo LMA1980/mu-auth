@@ -40,6 +40,8 @@ pub use folio::{FolioCatalog, PolicySet};
 pub use role::{
     validate_display_name, RoleActivation, RoleCatalog, RoleFolioIndex, RoleId, RoleSpec,
     StepUpRequirement, ANONYMOUS_ROLE_ID, HOST_TIMED_ROLE_CEILING_SECS, MIN_TIMED_ROLE_TTL_SECS,
+    SUPER_OPERATOR_HARD_TTL_SECS, SUPER_OPERATOR_IDLE_TTL_SECS, SUPER_OPERATOR_MAX_RENEWALS,
+    SUPER_OPERATOR_RENEW_EXTEND_SECS, SUPER_OPERATOR_RENEW_WINDOW_SECS, SUPER_OPERATOR_ROLE_ID,
 };
 pub use session::{
     evaluate_session, evaluate_session_with_disabled_subsystems, AuthAuthority, Principal,
@@ -48,9 +50,9 @@ pub use session::{
 pub use subsystem::{
     canonical_ab_deploy_manifest, canonical_cd_manifest, canonical_ci_manifest,
     canonical_manifests, canonical_model_runner_manifest, canonical_observability_manifest,
-    canonical_platform_manifest, canonical_repository_manifest, canonical_system_manifest, FolioId,
-    FolioOrigin, MaintenanceMode, MaintenanceOverride, Policy, PolicyFolio, PolicyId, SubsystemId,
-    SubsystemSecurityManifest, SubsystemStatus,
+    canonical_platform_manifest, canonical_repository_manifest, canonical_super_operator_folios,
+    canonical_system_manifest, FolioId, FolioOrigin, MaintenanceMode, MaintenanceOverride, Policy,
+    PolicyFolio, PolicyId, SubsystemId, SubsystemSecurityManifest, SubsystemStatus,
 };
 
 #[cfg(feature = "std")]
