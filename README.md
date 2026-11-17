@@ -21,6 +21,16 @@ Reusable `#![no_std]` + `alloc` (`#![forbid(unsafe_code)]`) authorization core f
 | `std`          | No          | Enables `serde/std`                                                             | File-backed secret resolution helpers (`resolve_secret_*`)                     |
 | `github-oauth` | No          | `std`, `hmac`, `sha2`, `hex`, `subtle`, `url`, `webauthn-rs-core`, `serde_json` | Framework-agnostic edge proxy adapter, HMAC invites, WebAuthn Passkey verifier |
 
+## Ecosystem Integration
+
+`mu-auth` serves as the shared policy, folio, role-lease, and edge/WebAuthn verification core across the platform ecosystem:
+
+- [**`mu-console`**](https://github.com/LMA1980/mu-console) (`mu-console-protocol`, `mu-console-data`, `mu-console-ui`): Evaluates `mu-auth` policy folios, role leases, and Passkey step-up challenges across capability-gated console areas.
+- [**`mu-ci-controller`**](https://github.com/LMA1980/mu-ci-controller): Exposes the `/api/auth/*` authority backed by `mu-auth` edge identity verification, HMAC invites, and WebAuthn Passkey step-up leases.
+- [**`mu-cd-controller`**](https://github.com/LMA1980/mu-cd-controller) (`CdAuthorizer`): Gates continuous delivery promotion, deployment, and rollback operations using `mu-auth` capability policies.
+- [**`mu-observable-hub`**](https://github.com/LMA1980/mu-observable-hub) (`MuAuthFolioVerifier`): Enforces `mu-auth` policy folio authorization on observability and analytics endpoints.
+- [**`jero-manager`**](https://github.com/LMA1980/jero-manager): Gates `/api/mr/v1/*` inference control-plane endpoints using `mu-auth` policy evaluation.
+
 ## License
 
 `mu-auth` is licensed under the GNU Lesser General Public License version 3.0 with the LGPL-3.0 Linking Exception (`LGPL-3.0-only WITH LGPL-3.0-linking-exception`). See [LICENSE](LICENSE), [COPYING](COPYING), and [LINKING-EXCEPTION](LINKING-EXCEPTION).
